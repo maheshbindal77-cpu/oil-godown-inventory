@@ -10,30 +10,57 @@ import db
 st.set_page_config(page_title="Oil Godown Inventory", page_icon="🛢️", layout="wide")
 
 
-def _app_password():
-    """Return the configured app password, or None if none is set (local use)."""
+# Pages an "operator" (e.g. the day-to-day user) is allowed to see. Everything
+# else — Edit/Correct and Setup — is manager-only.
+OPERATOR_PAGES = [
+    "Dashboard",
+    "Incoming Stock Entry",
+    "Outgoing Stock Entry",
+    "History & Logs",
+    "Data & Backups",
+]
+
+
+def _secret(name):
+    """Return a Streamlit secret, or None if it isn't set (e.g. local run)."""
     try:
-        return st.secrets["app_password"]
+        return st.secrets[name]
     except Exception:
         return None
 
 
 def require_login():
-    """Password gate. Active only when an `app_password` secret is configured
-    (i.e. when deployed online). Skipped for local runs so testing stays easy."""
-    expected = _app_password()
-    if expected is None:
-        return  # no password set -> local use, no gate
+    """Password gate with two roles:
+
+    - `admin_password` (manager) unlocks every page.
+    - `app_password` (operator) unlocks only the safe day-to-day pages.
+
+    If no admin password is configured, the app password grants full access
+    (backward compatible). If neither is set (local run), there is no gate.
+    """
+    operator_pw = _secret("app_password")
+    admin_pw = _secret("admin_password")
+
+    if operator_pw is None and admin_pw is None:
+        st.session_state["role"] = "admin"
+        return
 
     if st.session_state.get("auth_ok"):
         return
 
     st.title("🔒 Oil Godown Inventory")
-    st.caption("Please enter the password to continue.")
+    st.caption("Please enter your password to continue.")
     entered = st.text_input("Password", type="password")
     if entered:
-        if entered == expected:
+        role = None
+        if admin_pw is not None and entered == admin_pw:
+            role = "admin"
+        elif operator_pw is not None and entered == operator_pw:
+            # If no separate admin password exists, the app password is full access.
+            role = "operator" if admin_pw is not None else "admin"
+        if role:
             st.session_state["auth_ok"] = True
+            st.session_state["role"] = role
             st.rerun()
         else:
             st.error("Incorrect password. Please try again.")
@@ -524,5 +551,23 @@ PAGES = {
 }
 
 st.sidebar.title("Oil Godown Inventory")
-choice = st.sidebar.radio("Navigate", list(PAGES.keys()))
+
+role = st.session_state.get("role", "admin")
+if role == "admin":
+    visible_pages = list(PAGES.keys())
+else:
+    visible_pages = [p for p in PAGES if p in OPERATOR_PAGES]
+
+choice = st.sidebar.radio("Navigate", visible_pages)
+
+# Show who is signed in and a log-out button (only when a password is in use).
+if _secret("app_password") is not None or _secret("admin_password") is not None:
+    st.sidebar.divider()
+    st.sidebar.caption(
+        f"Signed in as: **{'Manager (full access)' if role == 'admin' else 'Operator (daily use)'}**"
+    )
+    if st.sidebar.button("Log out"):
+        st.session_state.clear()
+        st.rerun()
+
 PAGES[choice]()
