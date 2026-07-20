@@ -1,8 +1,5 @@
 [browser]
 gatherUsageStats = false
 
-[server]
-headless = false
-
 [theme]
 base = "light"
