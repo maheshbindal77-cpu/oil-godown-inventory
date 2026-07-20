@@ -17,6 +17,7 @@ OPERATOR_PAGES = [
     "Incoming Stock Entry",
     "Outgoing Stock Entry",
     "History & Logs",
+    "Edit / Correct Entries",
     "Data & Backups",
 ]
 
