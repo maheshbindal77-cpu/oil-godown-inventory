@@ -34,7 +34,20 @@ def require_login():
 
 
 require_login()
-db.init_db()
+
+try:
+    db.init_db()
+except Exception as e:
+    st.error("⚠️ The app couldn't connect to the database.")
+    st.markdown(
+        "This almost always means the **`db_url`** secret is wrong or incomplete. "
+        "Please check, in the app's **Settings → Secrets**, that:\n\n"
+        "- the whole connection string from Neon is present on one line, and\n"
+        "- it ends with **`sslmode=require`** (with the final **e**)."
+    )
+    with st.expander("Technical details (for troubleshooting)"):
+        st.code(str(e))
+    st.stop()
 
 
 def page_dashboard():
