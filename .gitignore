@@ -1,0 +1,8 @@
+# Never put secrets or local data in the code repository
+.streamlit/secrets.toml
+oil_inventory.db
+backups/
+__pycache__/
+*.pyc
+.DS_Store
+.claude/
