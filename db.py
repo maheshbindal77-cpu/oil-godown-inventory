@@ -64,6 +64,14 @@ outgoing_transactions = Table(
     Column("notes", String(1000)),
 )
 
+# Small key/value table used to remember one-off facts, e.g. whether the
+# sample data has already been seeded (so clearing data never re-seeds it).
+app_meta = Table(
+    "app_meta", metadata,
+    Column("key", String(50), primary_key=True),
+    Column("value", String(255)),
+)
+
 
 # ---------------------------------------------------------------------------
 # Engine
@@ -107,12 +115,19 @@ def get_engine():
 
 
 def init_db():
-    """Create tables if missing and seed sample data on first run."""
+    """Create tables if missing. Seed sample data only on the very first
+    initialisation (tracked in app_meta) so that clearing the data later never
+    causes the sample data to come back."""
     engine = get_engine()
     metadata.create_all(engine)
-    with engine.connect() as conn:
-        already = conn.execute(text("SELECT COUNT(*) FROM oil_types")).scalar()
-    if not already:
+    need_seed = False
+    with engine.begin() as conn:
+        seeded = conn.execute(text("SELECT value FROM app_meta WHERE key = 'seeded'")).scalar()
+        if seeded is None:
+            oil_count = conn.execute(text("SELECT COUNT(*) FROM oil_types")).scalar()
+            need_seed = oil_count == 0
+            conn.execute(app_meta.insert().values(key="seeded", value="yes"))
+    if need_seed:
         _seed_sample_data()
 
 
@@ -371,3 +386,65 @@ def get_transactions(
 
     result = pd.concat(frames, ignore_index=True)
     return result[columns].sort_values("date", ascending=False).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Setup / management (oil types, tanks) and one-time reset
+# ---------------------------------------------------------------------------
+
+def add_oil_type(name):
+    with get_engine().begin() as conn:
+        conn.execute(oil_types.insert().values(name=name))
+
+
+def delete_oil_type(oil_type_id):
+    with get_engine().begin() as conn:
+        used = conn.execute(
+            text("SELECT COUNT(*) FROM tanks WHERE oil_type_id = :id"), {"id": oil_type_id}
+        ).scalar()
+        if used:
+            raise ValueError("Cannot remove: some tanks still use this oil type. Remove those tanks first.")
+        conn.execute(text("DELETE FROM oil_types WHERE id = :id"), {"id": oil_type_id})
+
+
+def add_tank(name, oil_type_id, capacity):
+    with get_engine().begin() as conn:
+        conn.execute(
+            tanks.insert().values(
+                name=name, oil_type_id=oil_type_id, capacity=capacity, current_volume=0
+            )
+        )
+
+
+def update_tank_capacity(tank_id, capacity):
+    with get_engine().begin() as conn:
+        conn.execute(text("UPDATE tanks SET capacity = :c WHERE id = :id"), {"c": capacity, "id": tank_id})
+
+
+def delete_tank(tank_id):
+    with get_engine().begin() as conn:
+        vol = conn.execute(
+            text("SELECT current_volume FROM tanks WHERE id = :id"), {"id": tank_id}
+        ).scalar()
+        if vol and vol > 0:
+            raise ValueError("Cannot remove a tank that still holds stock. Dispatch/empty it first.")
+        has_history = conn.execute(
+            text(
+                "SELECT (SELECT COUNT(*) FROM incoming_transactions WHERE tank_id = :id) + "
+                "(SELECT COUNT(*) FROM outgoing_transactions WHERE tank_id = :id)"
+            ),
+            {"id": tank_id},
+        ).scalar()
+        if has_history:
+            raise ValueError("Cannot remove a tank that has transaction history (this protects your records).")
+        conn.execute(text("DELETE FROM tanks WHERE id = :id"), {"id": tank_id})
+
+
+def reset_all_data():
+    """Delete ALL records from every table. Used once to clear the sample data
+    before real records are entered. Guarded heavily in the app UI."""
+    with get_engine().begin() as conn:
+        conn.execute(text("DELETE FROM incoming_transactions"))
+        conn.execute(text("DELETE FROM outgoing_transactions"))
+        conn.execute(text("DELETE FROM tanks"))
+        conn.execute(text("DELETE FROM oil_types"))

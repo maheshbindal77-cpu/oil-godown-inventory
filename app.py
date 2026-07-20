@@ -10,12 +10,19 @@ import db
 st.set_page_config(page_title="Oil Godown Inventory", page_icon="🛢️", layout="wide")
 
 
+def _app_password():
+    """Return the configured app password, or None if none is set (local use)."""
+    try:
+        return st.secrets["app_password"]
+    except Exception:
+        return None
+
+
 def require_login():
     """Password gate. Active only when an `app_password` secret is configured
     (i.e. when deployed online). Skipped for local runs so testing stays easy."""
-    try:
-        expected = st.secrets["app_password"]
-    except Exception:
+    expected = _app_password()
+    if expected is None:
         return  # no password set -> local use, no gate
 
     if st.session_state.get("auth_ok"):
@@ -315,12 +322,132 @@ def page_backups():
     )
 
 
+def page_setup():
+    st.title("⚙️ Setup & Manage")
+    st.caption("Set up your real oil types and tanks here. Day-to-day stock entry stays "
+               "on the Incoming / Outgoing pages.")
+
+    oil_types = db.get_oil_types()
+
+    # --- Oil types ------------------------------------------------------
+    st.subheader("Oil Types")
+    if not oil_types.empty:
+        st.dataframe(oil_types[["name"]].rename(columns={"name": "Oil Type"}),
+                     hide_index=True, use_container_width=True)
+    else:
+        st.info("No oil types yet. Add your first one below.")
+
+    with st.form("add_oil_type", clear_on_submit=True):
+        new_oil = st.text_input("New oil type name (e.g. Furnace Oil)")
+        if st.form_submit_button("➕ Add oil type") and new_oil.strip():
+            try:
+                db.add_oil_type(new_oil.strip())
+                st.success(f"Added '{new_oil.strip()}'.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Couldn't add: {e}")
+
+    if not oil_types.empty:
+        del_oil = st.selectbox("Remove an oil type", ["—"] + oil_types["name"].tolist(), key="del_oil")
+        if del_oil != "—" and st.button("Remove selected oil type"):
+            try:
+                oid = int(oil_types.loc[oil_types["name"] == del_oil, "id"].iloc[0])
+                db.delete_oil_type(oid)
+                st.success(f"Removed '{del_oil}'.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    st.divider()
+
+    # --- Tanks ----------------------------------------------------------
+    st.subheader("Tanks")
+    tanks = db.get_tanks()
+    if not tanks.empty:
+        st.dataframe(
+            tanks[["name", "oil_type", "capacity", "current_volume"]].rename(columns={
+                "name": "Tank", "oil_type": "Oil Type",
+                "capacity": "Capacity (L)", "current_volume": "Current Volume (L)",
+            }),
+            hide_index=True, use_container_width=True,
+        )
+    else:
+        st.info("No tanks yet. Add your tanks below.")
+
+    if oil_types.empty:
+        st.warning("Add at least one oil type before creating tanks.")
+    else:
+        with st.form("add_tank", clear_on_submit=True):
+            tname = st.text_input("Tank name / number (e.g. Tank 1)")
+            toil = st.selectbox("Oil type stored in this tank", oil_types["name"])
+            tcap = st.number_input("Capacity (Litres)", min_value=0.0, step=100.0, format="%.0f")
+            if st.form_submit_button("➕ Add tank"):
+                if not tname.strip():
+                    st.error("Please enter a tank name.")
+                elif tcap <= 0:
+                    st.error("Capacity must be greater than zero.")
+                else:
+                    try:
+                        oid = int(oil_types.loc[oil_types["name"] == toil, "id"].iloc[0])
+                        db.add_tank(tname.strip(), oid, tcap)
+                        st.success(f"Added '{tname.strip()}'.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Couldn't add: {e}")
+
+        if not tanks.empty:
+            with st.expander("Edit or remove a tank"):
+                tk = st.selectbox("Choose a tank", tanks["name"], key="edit_tank")
+                row = tanks.loc[tanks["name"] == tk].iloc[0]
+                new_cap = st.number_input("New capacity (L)", min_value=0.0,
+                                          value=float(row["capacity"]), step=100.0, format="%.0f")
+                c1, c2 = st.columns(2)
+                if c1.button("Save new capacity"):
+                    db.update_tank_capacity(int(row["id"]), new_cap)
+                    st.success("Capacity updated.")
+                    st.rerun()
+                if c2.button("Remove this tank"):
+                    try:
+                        db.delete_tank(int(row["id"]))
+                        st.success(f"Removed '{tk}'.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+    st.divider()
+    st.info("💡 To set a tank's **opening stock**, go to the **Incoming Stock Entry** page and "
+            "log the current quantity as an incoming entry (with the rate you value it at). "
+            "That keeps your weighted-average rate correct from day one.")
+
+    st.divider()
+
+    # --- Danger zone ----------------------------------------------------
+    with st.expander("🚨 Danger zone — clear ALL data (use once to remove the sample data)"):
+        st.warning("This permanently deletes **every** oil type, tank, and transaction. "
+                   "Use it a single time to wipe the sample data before you enter your real "
+                   "records. It cannot happen by accident — you must type DELETE and re-enter "
+                   "the app password.")
+        confirm = st.text_input("Type DELETE to confirm", key="reset_confirm")
+        pw = st.text_input("Re-enter the app password", type="password", key="reset_pw")
+        expected_pw = _app_password()
+        if st.button("Erase everything and start fresh"):
+            if confirm != "DELETE":
+                st.error("You must type DELETE exactly to confirm.")
+            elif expected_pw is not None and pw != expected_pw:
+                st.error("App password is incorrect.")
+            else:
+                db.reset_all_data()
+                st.success("All data cleared. Add your real oil types and tanks above to begin.")
+                st.rerun()
+
+
 PAGES = {
     "Dashboard": page_dashboard,
     "Incoming Stock Entry": page_incoming,
     "Outgoing Stock Entry": page_outgoing,
     "History & Logs": page_history,
     "Data & Backups": page_backups,
+    "Setup & Manage": page_setup,
 }
 
 st.sidebar.title("Oil Godown Inventory")
