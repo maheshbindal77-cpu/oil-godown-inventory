@@ -438,13 +438,3 @@ def delete_tank(tank_id):
         if has_history:
             raise ValueError("Cannot remove a tank that has transaction history (this protects your records).")
         conn.execute(text("DELETE FROM tanks WHERE id = :id"), {"id": tank_id})
-
-
-def reset_all_data():
-    """Delete ALL records from every table. Used once to clear the sample data
-    before real records are entered. Guarded heavily in the app UI."""
-    with get_engine().begin() as conn:
-        conn.execute(text("DELETE FROM incoming_transactions"))
-        conn.execute(text("DELETE FROM outgoing_transactions"))
-        conn.execute(text("DELETE FROM tanks"))
-        conn.execute(text("DELETE FROM oil_types"))

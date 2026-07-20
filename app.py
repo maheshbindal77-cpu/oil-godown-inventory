@@ -419,27 +419,6 @@ def page_setup():
             "log the current quantity as an incoming entry (with the rate you value it at). "
             "That keeps your weighted-average rate correct from day one.")
 
-    st.divider()
-
-    # --- Danger zone ----------------------------------------------------
-    with st.expander("🚨 Danger zone — clear ALL data (use once to remove the sample data)"):
-        st.warning("This permanently deletes **every** oil type, tank, and transaction. "
-                   "Use it a single time to wipe the sample data before you enter your real "
-                   "records. It cannot happen by accident — you must type DELETE and re-enter "
-                   "the app password.")
-        confirm = st.text_input("Type DELETE to confirm", key="reset_confirm")
-        pw = st.text_input("Re-enter the app password", type="password", key="reset_pw")
-        expected_pw = _app_password()
-        if st.button("Erase everything and start fresh"):
-            if confirm != "DELETE":
-                st.error("You must type DELETE exactly to confirm.")
-            elif expected_pw is not None and pw != expected_pw:
-                st.error("App password is incorrect.")
-            else:
-                db.reset_all_data()
-                st.success("All data cleared. Add your real oil types and tanks above to begin.")
-                st.rerun()
-
 
 PAGES = {
     "Dashboard": page_dashboard,
