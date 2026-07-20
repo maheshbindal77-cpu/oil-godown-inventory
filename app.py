@@ -420,11 +420,105 @@ def page_setup():
             "That keeps your weighted-average rate correct from day one.")
 
 
+def page_edit():
+    st.title("✏️ Edit / Correct Entries")
+    st.caption("Fix or remove a single entry that was logged by mistake. The tank's stock "
+               "level is corrected automatically to match.")
+
+    txns = db.get_editable_transactions()
+    if txns.empty:
+        st.info("There are no transactions to edit yet.")
+        return
+
+    oil_types = db.get_oil_types()
+    tanks_all = db.get_tanks()
+
+    def _label(i):
+        r = txns.iloc[i]
+        return (f"{r['type']}  |  {r['date']}  |  {r['oil_type']}  |  {r['tank']}  |  "
+                f"{r['quantity']:,.0f} L  |  {r['party'] or ''}")
+
+    idx = st.selectbox("Choose the entry to fix", range(len(txns)), format_func=_label)
+    row = txns.iloc[idx]
+    ttype = row["type"]
+    txn_id = int(row["id"])
+
+    st.divider()
+
+    with st.form("edit_form"):
+        st.markdown(f"**Editing this {'incoming' if ttype == 'In' else 'outgoing'} entry**")
+        try:
+            default_date = date.fromisoformat(str(row["date"]))
+        except Exception:
+            default_date = date.today()
+        new_date = st.date_input("Date", value=default_date)
+
+        oil_names = oil_types["name"].tolist()
+        oil_default = oil_types.loc[oil_types["id"] == row["oil_type_id"], "name"]
+        oil_idx = oil_names.index(oil_default.iloc[0]) if not oil_default.empty else 0
+        oil_name = st.selectbox("Oil Type", oil_names, index=oil_idx)
+        new_oil_id = int(oil_types.loc[oil_types["name"] == oil_name, "id"].iloc[0])
+
+        tank_names = tanks_all["name"].tolist()
+        tank_default = tanks_all.loc[tanks_all["id"] == row["tank_id"], "name"]
+        tank_idx = tank_names.index(tank_default.iloc[0]) if not tank_default.empty else 0
+        tank_name = st.selectbox("Tank", tank_names, index=tank_idx)
+        new_tank_id = int(tanks_all.loc[tanks_all["name"] == tank_name, "id"].iloc[0])
+
+        new_qty = st.number_input("Quantity", min_value=0.0, value=float(row["quantity"]),
+                                  step=100.0, format="%.2f")
+        new_rate = new_party = new_notes = None
+        if ttype == "In":
+            new_rate = st.number_input("Purchase Rate per Unit", min_value=0.0,
+                                       value=float(row["rate"] or 0), step=0.5, format="%.2f")
+            new_party = st.text_input("Supplier / Batch No.", value=row["party"] or "")
+        else:
+            new_party = st.text_input("Tanker Number / Buyer", value=row["party"] or "")
+            new_notes = st.text_area("Notes", value=row["notes"] or "", height=80)
+
+        saved = st.form_submit_button("💾 Save changes")
+
+    if saved:
+        if new_qty <= 0:
+            st.error("Quantity must be greater than zero.")
+        elif ttype == "In" and new_rate <= 0:
+            st.error("Rate must be greater than zero.")
+        else:
+            try:
+                if ttype == "In":
+                    db.update_incoming(txn_id, new_date.isoformat(), new_oil_id, new_tank_id,
+                                       new_qty, new_rate, new_party)
+                else:
+                    db.update_outgoing(txn_id, new_date.isoformat(), new_oil_id, new_tank_id,
+                                       new_qty, new_party, new_notes)
+                st.success("Entry updated — the tank's stock has been corrected.")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+
+    st.divider()
+    st.subheader("Delete this entry")
+    st.write("Removing an entry also corrects the tank's stock. To avoid accidents, tick the "
+             "box first.")
+    confirm = st.checkbox("Yes, permanently delete the entry selected above")
+    if st.button("🗑️ Delete entry", disabled=not confirm):
+        try:
+            if ttype == "In":
+                db.delete_incoming(txn_id)
+            else:
+                db.delete_outgoing(txn_id)
+            st.success("Entry deleted — the tank's stock has been corrected.")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+
 PAGES = {
     "Dashboard": page_dashboard,
     "Incoming Stock Entry": page_incoming,
     "Outgoing Stock Entry": page_outgoing,
     "History & Logs": page_history,
+    "Edit / Correct Entries": page_edit,
     "Data & Backups": page_backups,
     "Setup & Manage": page_setup,
 }

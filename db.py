@@ -226,24 +226,59 @@ def get_tanks(oil_type_id: int | None = None) -> pd.DataFrame:
 # Writes
 # ---------------------------------------------------------------------------
 
+def _recompute_tank_volume(conn, tank_id):
+    """Set a tank's current volume to (all inflows − all outflows) for that tank.
+
+    Storing stock this way means adding, editing, or deleting any single entry
+    always leaves the tank level exactly correct — it can never drift.
+    """
+    if tank_id is None:
+        return
+    total = conn.execute(
+        text(
+            "SELECT "
+            "COALESCE((SELECT SUM(quantity) FROM incoming_transactions WHERE tank_id = :id), 0) - "
+            "COALESCE((SELECT SUM(quantity) FROM outgoing_transactions WHERE tank_id = :id), 0)"
+        ),
+        {"id": tank_id},
+    ).scalar()
+    conn.execute(text("UPDATE tanks SET current_volume = :v WHERE id = :id"), {"v": total, "id": tank_id})
+
+
+def _validate_tank(conn, tank_id):
+    """Raise if a tank's recomputed volume is impossible (negative or over capacity)."""
+    row = conn.execute(
+        text("SELECT current_volume, capacity, name FROM tanks WHERE id = :id"), {"id": tank_id}
+    ).fetchone()
+    if row is None:
+        return
+    vol, cap, name = row
+    if vol < -1e-6:
+        raise ValueError(
+            f"This change would make {name}'s stock negative ({vol:g} L). "
+            "Fix the other entries for this tank first."
+        )
+    if vol > cap + 1e-6:
+        raise ValueError(
+            f"This change would put {name} over its capacity ({vol:g} L vs {cap:g} L). "
+            "Reduce the quantity or raise the tank capacity in Setup."
+        )
+
+
 def add_incoming(date, oil_type_id, tank_id, quantity, rate, supplier):
-    engine = get_engine()
-    with engine.begin() as conn:
+    with get_engine().begin() as conn:
         conn.execute(
             incoming_transactions.insert().values(
                 date=date, oil_type_id=oil_type_id, tank_id=tank_id,
                 quantity=quantity, rate=rate, supplier=supplier,
             )
         )
-        conn.execute(
-            text("UPDATE tanks SET current_volume = current_volume + :q WHERE id = :id"),
-            {"q": quantity, "id": tank_id},
-        )
+        _recompute_tank_volume(conn, tank_id)
+        _validate_tank(conn, tank_id)
 
 
 def add_outgoing(date, oil_type_id, tank_id, quantity, buyer, notes):
-    engine = get_engine()
-    with engine.begin() as conn:
+    with get_engine().begin() as conn:
         current_volume = conn.execute(
             text("SELECT current_volume FROM tanks WHERE id = :id"), {"id": tank_id}
         ).scalar()
@@ -257,10 +292,90 @@ def add_outgoing(date, oil_type_id, tank_id, quantity, buyer, notes):
                 quantity=quantity, buyer=buyer, notes=notes,
             )
         )
+        _recompute_tank_volume(conn, tank_id)
+
+
+def get_editable_transactions(limit: int = 300) -> pd.DataFrame:
+    """Recent transactions with their id and type, for the edit/delete screen."""
+    engine = get_engine()
+    inc = pd.read_sql(text(
+        "SELECT i.id, 'In' AS type, i.date, i.oil_type_id, o.name AS oil_type, "
+        "i.tank_id, t.name AS tank, i.quantity, i.rate, i.supplier AS party "
+        "FROM incoming_transactions i JOIN oil_types o ON o.id = i.oil_type_id "
+        "JOIN tanks t ON t.id = i.tank_id"
+    ), engine)
+    out = pd.read_sql(text(
+        "SELECT o2.id, 'Out' AS type, o2.date, o2.oil_type_id, o.name AS oil_type, "
+        "o2.tank_id, t.name AS tank, o2.quantity, o2.buyer AS party, o2.notes "
+        "FROM outgoing_transactions o2 JOIN oil_types o ON o.id = o2.oil_type_id "
+        "JOIN tanks t ON t.id = o2.tank_id"
+    ), engine)
+    if "notes" not in inc.columns:
+        inc["notes"] = None
+    if "rate" not in out.columns:
+        out["rate"] = None
+    cols = ["id", "type", "date", "oil_type_id", "oil_type", "tank_id", "tank",
+            "quantity", "rate", "party", "notes"]
+    frames = [d for d in (inc, out) if not d.empty]
+    if not frames:
+        return pd.DataFrame(columns=cols)
+    for f in frames:  # explicit dtypes so concat never infers from an all-empty column
+        f["rate"] = f["rate"].astype("float64")
+        f["notes"] = f["notes"].astype("object")
+    result = pd.concat([f[cols] for f in frames], ignore_index=True)
+    return result.sort_values("date", ascending=False).head(limit).reset_index(drop=True)
+
+
+def update_incoming(txn_id, date, oil_type_id, tank_id, quantity, rate, supplier):
+    with get_engine().begin() as conn:
+        old_tank = conn.execute(
+            text("SELECT tank_id FROM incoming_transactions WHERE id = :id"), {"id": txn_id}
+        ).scalar()
         conn.execute(
-            text("UPDATE tanks SET current_volume = current_volume - :q WHERE id = :id"),
-            {"q": quantity, "id": tank_id},
+            text("UPDATE incoming_transactions SET date = :d, oil_type_id = :o, tank_id = :t, "
+                 "quantity = :q, rate = :r, supplier = :s WHERE id = :id"),
+            {"d": date, "o": oil_type_id, "t": tank_id, "q": quantity, "r": rate,
+             "s": supplier, "id": txn_id},
         )
+        for tk in {old_tank, tank_id}:
+            _recompute_tank_volume(conn, tk)
+            _validate_tank(conn, tk)
+
+
+def update_outgoing(txn_id, date, oil_type_id, tank_id, quantity, buyer, notes):
+    with get_engine().begin() as conn:
+        old_tank = conn.execute(
+            text("SELECT tank_id FROM outgoing_transactions WHERE id = :id"), {"id": txn_id}
+        ).scalar()
+        conn.execute(
+            text("UPDATE outgoing_transactions SET date = :d, oil_type_id = :o, tank_id = :t, "
+                 "quantity = :q, buyer = :b, notes = :n WHERE id = :id"),
+            {"d": date, "o": oil_type_id, "t": tank_id, "q": quantity, "b": buyer,
+             "n": notes, "id": txn_id},
+        )
+        for tk in {old_tank, tank_id}:
+            _recompute_tank_volume(conn, tk)
+            _validate_tank(conn, tk)
+
+
+def delete_incoming(txn_id):
+    with get_engine().begin() as conn:
+        tank_id = conn.execute(
+            text("SELECT tank_id FROM incoming_transactions WHERE id = :id"), {"id": txn_id}
+        ).scalar()
+        conn.execute(text("DELETE FROM incoming_transactions WHERE id = :id"), {"id": txn_id})
+        _recompute_tank_volume(conn, tank_id)
+        _validate_tank(conn, tank_id)
+
+
+def delete_outgoing(txn_id):
+    with get_engine().begin() as conn:
+        tank_id = conn.execute(
+            text("SELECT tank_id FROM outgoing_transactions WHERE id = :id"), {"id": txn_id}
+        ).scalar()
+        conn.execute(text("DELETE FROM outgoing_transactions WHERE id = :id"), {"id": txn_id})
+        _recompute_tank_volume(conn, tank_id)
+        _validate_tank(conn, tank_id)
 
 
 # ---------------------------------------------------------------------------
