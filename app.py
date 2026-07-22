@@ -191,8 +191,8 @@ def page_incoming():
         else:
             db.add_incoming(entry_date.isoformat(), oil_type_id, quantity, rate, supplier)
             st.cache_data.clear()
-            st.success(f"Logged {quantity:,.0f} L of {oil_type_name} into stock.")
-            st.rerun()
+            st.success(f"✅ Saved: {quantity:,.0f} L of {oil_type_name} into stock. "
+                       "You can enter the next one.")
 
 
 def page_outgoing():
@@ -229,8 +229,8 @@ def page_outgoing():
             try:
                 db.add_outgoing(entry_date.isoformat(), oil_type_id, quantity, buyer, notes)
                 st.cache_data.clear()
-                st.success(f"Logged {quantity:,.0f} L of {oil_type_name} out.")
-                st.rerun()
+                st.success(f"✅ Saved: {quantity:,.0f} L of {oil_type_name} out. "
+                           "You can enter the next one.")
             except ValueError as e:
                 st.error(str(e))
 
