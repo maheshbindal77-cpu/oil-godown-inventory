@@ -22,6 +22,7 @@ OPERATOR_PAGES = [
     "Incoming Stock Entry",
     "Outgoing Stock Entry",
     "History & Logs",
+    "Stock & Rate History",
     "Edit / Correct Entries",
     "Data & Backups",
 ]
@@ -323,6 +324,47 @@ def page_edit():
             st.error(str(e))
 
 
+def page_ledger():
+    st.title("📈 Stock & Rate History")
+    st.caption("For each oil type, see how its stock quantity and its average rate changed "
+               "after every incoming and outgoing entry. The rate uses FIFO — the oldest oil "
+               "is counted as sold first.")
+
+    oil_types = db.get_oil_types()
+    if oil_types.empty:
+        st.info("No oil types yet. Add them on the **Setup & Manage** page.")
+        return
+
+    oil_name = st.selectbox("Oil Type", oil_types["name"])
+    oid = int(oil_types.loc[oil_types["name"] == oil_name, "id"].iloc[0])
+
+    ledger = db.get_stock_ledger(oid)
+    if ledger.empty:
+        st.info("No transactions for this oil type yet.")
+        return
+
+    st.dataframe(
+        ledger.style.format({
+            "Stock After (L)": "{:,.0f}",
+            "Avg Rate After (₹)": "{:,.2f}",
+            "Value After (₹)": "{:,.0f}",
+        }),
+        hide_index=True, use_container_width=True,
+    )
+
+    st.download_button(
+        "⬇️ Download this history as CSV",
+        data=ledger.to_csv(index=False).encode("utf-8"),
+        file_name=f"stock_history_{oil_name}_{date.today().isoformat()}.csv",
+        mime="text/csv",
+    )
+
+    st.subheader("Average rate over time")
+    st.line_chart(ledger, x="Date", y="Avg Rate After (₹)")
+    st.subheader("Stock quantity over time")
+    st.line_chart(ledger, x="Date", y="Stock After (L)")
+
+
 def page_backups():
     st.title("💾 Data & Backups")
     st.caption("Your data is stored in a hosted cloud database, backed up automatically by the "
@@ -405,6 +447,7 @@ PAGES = {
     "Incoming Stock Entry": page_incoming,
     "Outgoing Stock Entry": page_outgoing,
     "History & Logs": page_history,
+    "Stock & Rate History": page_ledger,
     "Edit / Correct Entries": page_edit,
     "Data & Backups": page_backups,
     "Setup & Manage": page_setup,

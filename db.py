@@ -8,6 +8,7 @@ otherwise so the app can be run locally for testing.
 """
 
 import os
+from collections import deque
 from pathlib import Path
 
 import pandas as pd
@@ -306,41 +307,107 @@ def delete_outgoing(txn_id):
 
 
 # ---------------------------------------------------------------------------
-# Dashboard aggregates
+# FIFO valuation — the rate reflects the oil actually still in the godown.
+# Outflows are matched against the oldest purchases first.
 # ---------------------------------------------------------------------------
 
-def get_weighted_avg_rates() -> pd.DataFrame:
-    """Weighted average purchase rate per oil type, from ALL historical inflows."""
-    query = """
-        SELECT o.id AS oil_type_id, o.name AS oil_type,
-               SUM(i.quantity * i.rate) AS total_cost,
-               SUM(i.quantity) AS total_quantity
-        FROM incoming_transactions i
-        JOIN oil_types o ON o.id = i.oil_type_id
-        GROUP BY o.id, o.name
-    """
-    df = pd.read_sql(text(query), get_engine())
-    if df.empty:
-        return pd.DataFrame(columns=["oil_type_id", "oil_type", "total_cost",
-                                     "total_quantity", "weighted_avg_rate"])
-    df["weighted_avg_rate"] = df["total_cost"] / df["total_quantity"]
-    return df
+def _all_transactions_ordered(oil_type_id=None) -> pd.DataFrame:
+    """Every transaction (both kinds) in chronological order. On the same date,
+    incoming is processed before outgoing, then by insertion order (id)."""
+    engine = get_engine()
+    params = {}
+    inc_where = out_where = ""
+    if oil_type_id is not None:
+        inc_where = " WHERE i.oil_type_id = :oil"
+        out_where = " WHERE o2.oil_type_id = :oil"
+        params["oil"] = oil_type_id
+    inc = pd.read_sql(text(
+        "SELECT i.id, 'In' AS type, i.date, i.oil_type_id, i.quantity, i.rate "
+        "FROM incoming_transactions i" + inc_where), engine, params=params)
+    out = pd.read_sql(text(
+        "SELECT o2.id, 'Out' AS type, o2.date, o2.oil_type_id, o2.quantity, NULL AS rate "
+        "FROM outgoing_transactions o2" + out_where), engine, params=params)
+    inc["rate"] = inc["rate"].astype("float64")
+    out["rate"] = out["rate"].astype("float64")
+    cols = ["id", "type", "date", "oil_type_id", "quantity", "rate"]
+    frames = [d for d in (inc, out) if not d.empty]
+    if not frames:
+        return pd.DataFrame(columns=cols + ["type_rank"])
+    df = pd.concat([f[cols] for f in frames], ignore_index=True)
+    df["type_rank"] = df["type"].map({"In": 0, "Out": 1})
+    return df.sort_values(["date", "type_rank", "id"]).reset_index(drop=True)
+
+
+def _fifo_remaining(transactions):
+    """Consume each outflow against the oldest inflows first; return the batches
+    still in stock as a list of [quantity, rate]."""
+    batches = deque()
+    for t in transactions:
+        if t["type"] == "In":
+            batches.append([float(t["quantity"]), float(t["rate"])])
+        else:
+            out = float(t["quantity"])
+            while out > 1e-9 and batches:
+                b = batches[0]
+                take = min(b[0], out)
+                b[0] -= take
+                out -= take
+                if b[0] <= 1e-9:
+                    batches.popleft()
+    return list(batches)
 
 
 def get_stock_by_oil_type() -> pd.DataFrame:
-    """Current stock, weighted average rate, and valuation per oil type."""
-    stock = pd.read_sql(text(
-        "SELECT o.id AS oil_type_id, o.name AS oil_type, "
-        "COALESCE((SELECT SUM(quantity) FROM incoming_transactions i WHERE i.oil_type_id = o.id), 0) - "
-        "COALESCE((SELECT SUM(quantity) FROM outgoing_transactions x WHERE x.oil_type_id = o.id), 0) "
-        "AS current_stock "
-        "FROM oil_types o ORDER BY o.name"
-    ), get_engine())
-    rates = get_weighted_avg_rates()[["oil_type_id", "weighted_avg_rate"]]
-    merged = stock.merge(rates, on="oil_type_id", how="left")
-    merged["weighted_avg_rate"] = merged["weighted_avg_rate"].fillna(0)
-    merged["total_value"] = merged["current_stock"] * merged["weighted_avg_rate"]
-    return merged
+    """Current stock, FIFO average rate, and FIFO valuation per oil type."""
+    oils = get_oil_types()
+    alltx = _all_transactions_ordered()
+    rows = []
+    for _, o in oils.iterrows():
+        oid = int(o["id"])
+        txns = alltx[alltx["oil_type_id"] == oid].to_dict("records") if not alltx.empty else []
+        batches = _fifo_remaining(txns)
+        qty = sum(b[0] for b in batches)
+        value = sum(b[0] * b[1] for b in batches)
+        avg = value / qty if qty > 1e-9 else 0.0
+        rows.append({"oil_type_id": oid, "oil_type": o["name"],
+                     "current_stock": qty, "weighted_avg_rate": avg, "total_value": value})
+    return pd.DataFrame(rows, columns=["oil_type_id", "oil_type", "current_stock",
+                                       "weighted_avg_rate", "total_value"])
+
+
+def get_stock_ledger(oil_type_id) -> pd.DataFrame:
+    """Running history for one oil type: after each entry, the resulting stock
+    quantity, FIFO average rate, and value at that point in time."""
+    alltx = _all_transactions_ordered(oil_type_id)
+    batches = deque()
+    rows = []
+    for t in alltx.to_dict("records"):
+        if t["type"] == "In":
+            batches.append([float(t["quantity"]), float(t["rate"])])
+            change = f"+ {t['quantity']:,.0f} L  @ ₹{t['rate']:,.2f}"
+        else:
+            out = float(t["quantity"])
+            while out > 1e-9 and batches:
+                b = batches[0]
+                take = min(b[0], out)
+                b[0] -= take
+                out -= take
+                if b[0] <= 1e-9:
+                    batches.popleft()
+            change = f"− {t['quantity']:,.0f} L"
+        qty = sum(b[0] for b in batches)
+        value = sum(b[0] * b[1] for b in batches)
+        avg = value / qty if qty > 1e-9 else 0.0
+        rows.append({
+            "Date": t["date"],
+            "Movement": "Incoming" if t["type"] == "In" else "Outgoing",
+            "Change": change,
+            "Stock After (L)": qty,
+            "Avg Rate After (₹)": avg,
+            "Value After (₹)": value,
+        })
+    return pd.DataFrame(rows, columns=["Date", "Movement", "Change",
+                                       "Stock After (L)", "Avg Rate After (₹)", "Value After (₹)"])
 
 
 # ---------------------------------------------------------------------------
