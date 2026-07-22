@@ -93,13 +93,39 @@ def load_transactions(start=None, end=None, oil_type_id=None, txn_type="All"):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_editable_transactions():
-    return db.get_editable_transactions()
+def load_editable_transactions(start=None, end=None, oil_type_id=None, txn_type="All"):
+    return db.get_editable_transactions(start, end, oil_type_id, txn_type)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_stock_ledger(oil_type_id):
     return db.get_stock_ledger(oil_type_id)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_change_log():
+    return db.get_change_log()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_oil_reference(oil_type_id):
+    return db.get_oil_reference(oil_type_id)
+
+
+def _big_value_warning(ref, quantity, rate=None):
+    """Return a warning string if a quantity/rate looks unusually large compared
+    with the biggest seen so far (catches slipped-zero typos), else None."""
+    factor = 5
+    msgs = []
+    if ref["max_qty"] > 0 and quantity > factor * ref["max_qty"]:
+        msgs.append(f"that quantity is far larger than usual (your biggest so far was "
+                    f"{ref['max_qty']:,.0f} L)")
+    if rate is not None and ref["max_rate"] > 0 and rate > factor * ref["max_rate"]:
+        msgs.append(f"that rate is far higher than usual (your highest so far was "
+                    f"₹{ref['max_rate']:,.2f})")
+    if not msgs:
+        return None
+    return (" and ".join(msgs) + ".").capitalize()
 
 
 require_login()
@@ -189,10 +215,32 @@ def page_incoming():
         elif rate <= 0:
             st.error("Rate must be greater than zero.")
         else:
-            db.add_incoming(entry_date.isoformat(), oil_type_id, quantity, rate, supplier)
+            warn = _big_value_warning(load_oil_reference(oil_type_id), quantity, rate)
+            if warn:
+                st.session_state["pending_in"] = {
+                    "date": entry_date.isoformat(), "oil_id": oil_type_id,
+                    "oil_name": oil_type_name, "quantity": quantity, "rate": rate,
+                    "supplier": supplier, "warn": warn,
+                }
+            else:
+                db.add_incoming(entry_date.isoformat(), oil_type_id, quantity, rate, supplier)
+                st.cache_data.clear()
+                st.success(f"✅ Saved: {quantity:,.0f} L of {oil_type_name} into stock. "
+                           "You can enter the next one.")
+
+    pend = st.session_state.get("pending_in")
+    if pend:
+        st.warning(f"⚠️ {pend['warn']} Please double-check: "
+                   f"**{pend['quantity']:,.0f} L of {pend['oil_name']} @ ₹{pend['rate']:,.2f}**.")
+        c1, c2 = st.columns(2)
+        if c1.button("✅ Yes, it's correct — save it", key="confirm_in"):
+            db.add_incoming(pend["date"], pend["oil_id"], pend["quantity"], pend["rate"], pend["supplier"])
             st.cache_data.clear()
-            st.success(f"✅ Saved: {quantity:,.0f} L of {oil_type_name} into stock. "
-                       "You can enter the next one.")
+            del st.session_state["pending_in"]
+            st.success(f"✅ Saved: {pend['quantity']:,.0f} L of {pend['oil_name']} into stock.")
+        if c2.button("✖️ Cancel — let me fix it", key="cancel_in"):
+            del st.session_state["pending_in"]
+            st.info("Cancelled — nothing was saved. Re-enter the correct value.")
 
 
 def page_outgoing():
@@ -226,13 +274,39 @@ def page_outgoing():
             st.error(f"Cannot dispatch {quantity:,.0f} L — only {available:,.0f} L of "
                      f"{oil_type_name} is in the godown.")
         else:
+            warn = _big_value_warning(load_oil_reference(oil_type_id), quantity)
+            if warn:
+                st.session_state["pending_out"] = {
+                    "date": entry_date.isoformat(), "oil_id": oil_type_id,
+                    "oil_name": oil_type_name, "quantity": quantity, "buyer": buyer,
+                    "notes": notes, "warn": warn,
+                }
+            else:
+                try:
+                    db.add_outgoing(entry_date.isoformat(), oil_type_id, quantity, buyer, notes)
+                    st.cache_data.clear()
+                    st.success(f"✅ Saved: {quantity:,.0f} L of {oil_type_name} out. "
+                               "You can enter the next one.")
+                except ValueError as e:
+                    st.error(str(e))
+
+    pend = st.session_state.get("pending_out")
+    if pend:
+        st.warning(f"⚠️ {pend['warn']} Please double-check: "
+                   f"**{pend['quantity']:,.0f} L of {pend['oil_name']} out**.")
+        c1, c2 = st.columns(2)
+        if c1.button("✅ Yes, it's correct — save it", key="confirm_out"):
             try:
-                db.add_outgoing(entry_date.isoformat(), oil_type_id, quantity, buyer, notes)
+                db.add_outgoing(pend["date"], pend["oil_id"], pend["quantity"], pend["buyer"], pend["notes"])
                 st.cache_data.clear()
-                st.success(f"✅ Saved: {quantity:,.0f} L of {oil_type_name} out. "
-                           "You can enter the next one.")
+                del st.session_state["pending_out"]
+                st.success(f"✅ Saved: {pend['quantity']:,.0f} L of {pend['oil_name']} out.")
             except ValueError as e:
+                del st.session_state["pending_out"]
                 st.error(str(e))
+        if c2.button("✖️ Cancel — let me fix it", key="cancel_out"):
+            del st.session_state["pending_out"]
+            st.info("Cancelled — nothing was saved. Re-enter the correct value.")
 
 
 def page_history():
@@ -275,18 +349,62 @@ def page_history():
         mime="text/csv",
     )
 
+    st.divider()
+    with st.expander("🧾 Change log — every edit & deletion (audit trail)"):
+        st.caption("A permanent record of any entry that was changed or removed, so nothing "
+                   "is ever altered silently.")
+        log = load_change_log()
+        if log.empty:
+            st.info("No edits or deletions have been made yet.")
+        else:
+            st.dataframe(
+                log.rename(columns={
+                    "timestamp": "When", "action": "Action",
+                    "record_type": "Entry", "details": "What changed",
+                }),
+                hide_index=True, use_container_width=True,
+            )
+            st.download_button(
+                "⬇️ Download change log (CSV)",
+                data=log.to_csv(index=False).encode("utf-8"),
+                file_name="change_log.csv",
+                mime="text/csv",
+            )
+
 
 def page_edit():
     st.title("✏️ Edit / Correct Entries")
     st.caption("Fix or remove a single entry that was logged by mistake. Stock levels are "
-               "corrected automatically.")
-
-    txns = load_editable_transactions()
-    if txns.empty:
-        st.info("There are no transactions to edit yet.")
-        return
+               "corrected automatically. Use the filters to reach any entry, however old.")
 
     oil_types = load_oil_types()
+
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        f_start = st.date_input("From date", value=None, key="edit_from")
+    with f2:
+        f_end = st.date_input("To date", value=None, key="edit_to")
+    with f3:
+        f_oil = st.selectbox("Oil Type", ["All"] + oil_types["name"].tolist(), key="edit_oil")
+    with f4:
+        f_type = st.selectbox("Type", ["All", "In", "Out"], key="edit_type")
+
+    f_oil_id = None
+    if f_oil != "All" and not oil_types.empty:
+        f_oil_id = int(oil_types.loc[oil_types["name"] == f_oil, "id"].iloc[0])
+
+    txns = load_editable_transactions(
+        f_start.isoformat() if isinstance(f_start, date) else None,
+        f_end.isoformat() if isinstance(f_end, date) else None,
+        f_oil_id,
+        f_type,
+    )
+    if txns.empty:
+        st.info("No entries match these filters.")
+        return
+
+    st.caption(f"Showing {len(txns)} matching entr{'y' if len(txns) == 1 else 'ies'}, newest first "
+               "(narrow the filters if you don't see the one you want).")
 
     def _label(i):
         r = txns.iloc[i]

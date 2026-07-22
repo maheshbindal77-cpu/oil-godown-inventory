@@ -9,6 +9,7 @@ otherwise so the app can be run locally for testing.
 
 import os
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -59,6 +60,18 @@ app_meta = Table(
     "app_meta", metadata,
     Column("key", String(50), primary_key=True),
     Column("value", String(255)),
+)
+
+# Audit trail: every edit and deletion of an entry is recorded here so nothing
+# is ever silently changed.
+change_log = Table(
+    "change_log", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("timestamp", String(30), nullable=False),
+    Column("action", String(20), nullable=False),
+    Column("record_type", String(10), nullable=False),
+    Column("record_id", Integer),
+    Column("details", String(2000)),
 )
 
 
@@ -233,24 +246,46 @@ def add_outgoing(date, oil_type_id, quantity, buyer, notes):
 # Edit / delete individual entries
 # ---------------------------------------------------------------------------
 
-def get_editable_transactions(limit: int = 300) -> pd.DataFrame:
+def get_editable_transactions(start=None, end=None, oil_type_id=None, txn_type="All",
+                              limit: int = 500) -> pd.DataFrame:
+    """Transactions available to edit, filtered so any entry (however old) is
+    reachable. `limit` only caps how many the dropdown shows at once — narrow
+    the filters to reach older ones."""
     engine = get_engine()
-    inc = pd.read_sql(text(
-        "SELECT i.id, 'In' AS type, i.date, i.oil_type_id, o.name AS oil_type, "
-        "i.quantity, i.rate, i.supplier AS party "
-        "FROM incoming_transactions i JOIN oil_types o ON o.id = i.oil_type_id"
-    ), engine)
-    out = pd.read_sql(text(
-        "SELECT o2.id, 'Out' AS type, o2.date, o2.oil_type_id, o.name AS oil_type, "
-        "o2.quantity, o2.buyer AS party, o2.notes "
-        "FROM outgoing_transactions o2 JOIN oil_types o ON o.id = o2.oil_type_id"
-    ), engine)
-    if "notes" not in inc.columns:
-        inc["notes"] = None
-    if "rate" not in out.columns:
-        out["rate"] = None
+    frames = []
     cols = ["id", "type", "date", "oil_type_id", "oil_type", "quantity", "rate", "party", "notes"]
-    frames = [d for d in (inc, out) if not d.empty]
+
+    if txn_type in ("All", "In"):
+        q = ("SELECT i.id, 'In' AS type, i.date, i.oil_type_id, o.name AS oil_type, "
+             "i.quantity, i.rate, i.supplier AS party "
+             "FROM incoming_transactions i JOIN oil_types o ON o.id = i.oil_type_id WHERE 1=1")
+        params = {}
+        if start:
+            q += " AND i.date >= :start"; params["start"] = start
+        if end:
+            q += " AND i.date <= :end"; params["end"] = end
+        if oil_type_id:
+            q += " AND i.oil_type_id = :oil"; params["oil"] = oil_type_id
+        inc = pd.read_sql(text(q), engine, params=params)
+        inc["notes"] = None
+        frames.append(inc)
+
+    if txn_type in ("All", "Out"):
+        q = ("SELECT o2.id, 'Out' AS type, o2.date, o2.oil_type_id, o.name AS oil_type, "
+             "o2.quantity, o2.buyer AS party, o2.notes "
+             "FROM outgoing_transactions o2 JOIN oil_types o ON o.id = o2.oil_type_id WHERE 1=1")
+        params = {}
+        if start:
+            q += " AND o2.date >= :start"; params["start"] = start
+        if end:
+            q += " AND o2.date <= :end"; params["end"] = end
+        if oil_type_id:
+            q += " AND o2.oil_type_id = :oil"; params["oil"] = oil_type_id
+        out = pd.read_sql(text(q), engine, params=params)
+        out["rate"] = None
+        frames.append(out)
+
+    frames = [f for f in frames if not f.empty]
     if not frames:
         return pd.DataFrame(columns=cols)
     for f in frames:
@@ -260,50 +295,130 @@ def get_editable_transactions(limit: int = 300) -> pd.DataFrame:
     return result.sort_values("date", ascending=False).head(limit).reset_index(drop=True)
 
 
+# --- change log helpers -----------------------------------------------------
+
+def _oil_name(conn, oil_type_id):
+    return conn.execute(
+        text("SELECT name FROM oil_types WHERE id = :id"), {"id": oil_type_id}
+    ).scalar() or "?"
+
+
+def _record_change(conn, action, record_type, record_id, details):
+    conn.execute(change_log.insert().values(
+        timestamp=datetime.now().isoformat(sep=" ", timespec="seconds"),
+        action=action, record_type=record_type, record_id=record_id, details=details))
+
+
+def _describe_diff(conn, old, new_vals, is_incoming):
+    """Build a readable 'field old→new' summary of what changed."""
+    parts = []
+    if str(old.date) != str(new_vals["date"]):
+        parts.append(f"date {old.date}→{new_vals['date']}")
+    if old.oil_type_id != new_vals["oil_type_id"]:
+        parts.append(f"oil {_oil_name(conn, old.oil_type_id)}→{_oil_name(conn, new_vals['oil_type_id'])}")
+    if float(old.quantity) != float(new_vals["quantity"]):
+        parts.append(f"qty {old.quantity:g}→{new_vals['quantity']:g}")
+    if is_incoming:
+        if float(old.rate) != float(new_vals["rate"]):
+            parts.append(f"rate {old.rate:g}→{new_vals['rate']:g}")
+        if (old.supplier or "") != (new_vals["party"] or ""):
+            parts.append(f"supplier '{old.supplier or ''}'→'{new_vals['party'] or ''}'")
+    else:
+        if (old.buyer or "") != (new_vals["party"] or ""):
+            parts.append(f"buyer '{old.buyer or ''}'→'{new_vals['party'] or ''}'")
+        if (old.notes or "") != (new_vals["notes"] or ""):
+            parts.append(f"notes '{old.notes or ''}'→'{new_vals['notes'] or ''}'")
+    return "; ".join(parts) if parts else "no field changes"
+
+
 def update_incoming(txn_id, date, oil_type_id, quantity, rate, supplier):
     with get_engine().begin() as conn:
-        old_oil = conn.execute(
-            text("SELECT oil_type_id FROM incoming_transactions WHERE id = :id"), {"id": txn_id}
-        ).scalar()
+        old = conn.execute(
+            text("SELECT date, oil_type_id, quantity, rate, supplier "
+                 "FROM incoming_transactions WHERE id = :id"), {"id": txn_id}
+        ).fetchone()
         conn.execute(
             text("UPDATE incoming_transactions SET date = :d, oil_type_id = :o, "
                  "quantity = :q, rate = :r, supplier = :s WHERE id = :id"),
             {"d": date, "o": oil_type_id, "q": quantity, "r": rate, "s": supplier, "id": txn_id},
         )
+        old_oil = old.oil_type_id if old else oil_type_id
         for oid in {old_oil, oil_type_id}:
             _validate_oil_stock(conn, oid)
+        if old:
+            new_vals = {"date": date, "oil_type_id": oil_type_id, "quantity": quantity,
+                        "rate": rate, "party": supplier, "notes": None}
+            _record_change(conn, "Edited", "Incoming", txn_id, _describe_diff(conn, old, new_vals, True))
 
 
 def update_outgoing(txn_id, date, oil_type_id, quantity, buyer, notes):
     with get_engine().begin() as conn:
-        old_oil = conn.execute(
-            text("SELECT oil_type_id FROM outgoing_transactions WHERE id = :id"), {"id": txn_id}
-        ).scalar()
+        old = conn.execute(
+            text("SELECT date, oil_type_id, quantity, buyer, notes "
+                 "FROM outgoing_transactions WHERE id = :id"), {"id": txn_id}
+        ).fetchone()
         conn.execute(
             text("UPDATE outgoing_transactions SET date = :d, oil_type_id = :o, "
                  "quantity = :q, buyer = :b, notes = :n WHERE id = :id"),
             {"d": date, "o": oil_type_id, "q": quantity, "b": buyer, "n": notes, "id": txn_id},
         )
+        old_oil = old.oil_type_id if old else oil_type_id
         for oid in {old_oil, oil_type_id}:
             _validate_oil_stock(conn, oid)
+        if old:
+            new_vals = {"date": date, "oil_type_id": oil_type_id, "quantity": quantity,
+                        "rate": None, "party": buyer, "notes": notes}
+            _record_change(conn, "Edited", "Outgoing", txn_id, _describe_diff(conn, old, new_vals, False))
 
 
 def delete_incoming(txn_id):
     with get_engine().begin() as conn:
-        oil_id = conn.execute(
-            text("SELECT oil_type_id FROM incoming_transactions WHERE id = :id"), {"id": txn_id}
-        ).scalar()
+        old = conn.execute(
+            text("SELECT date, oil_type_id, quantity, rate, supplier "
+                 "FROM incoming_transactions WHERE id = :id"), {"id": txn_id}
+        ).fetchone()
         conn.execute(text("DELETE FROM incoming_transactions WHERE id = :id"), {"id": txn_id})
-        _validate_oil_stock(conn, oil_id)
+        if old:
+            _validate_oil_stock(conn, old.oil_type_id)
+            details = (f"{old.date} | {_oil_name(conn, old.oil_type_id)} | "
+                       f"{old.quantity:g} L @ ₹{old.rate:g} | {old.supplier or ''}")
+            _record_change(conn, "Deleted", "Incoming", txn_id, details)
 
 
 def delete_outgoing(txn_id):
     with get_engine().begin() as conn:
-        oil_id = conn.execute(
-            text("SELECT oil_type_id FROM outgoing_transactions WHERE id = :id"), {"id": txn_id}
-        ).scalar()
+        old = conn.execute(
+            text("SELECT date, oil_type_id, quantity, buyer, notes "
+                 "FROM outgoing_transactions WHERE id = :id"), {"id": txn_id}
+        ).fetchone()
         conn.execute(text("DELETE FROM outgoing_transactions WHERE id = :id"), {"id": txn_id})
-        _validate_oil_stock(conn, oil_id)
+        if old:
+            _validate_oil_stock(conn, old.oil_type_id)
+            details = (f"{old.date} | {_oil_name(conn, old.oil_type_id)} | "
+                       f"{old.quantity:g} L | {old.buyer or ''}")
+            _record_change(conn, "Deleted", "Outgoing", txn_id, details)
+
+
+def get_change_log(limit: int = 500) -> pd.DataFrame:
+    return pd.read_sql(text(
+        "SELECT timestamp, action, record_type, details FROM change_log "
+        f"ORDER BY id DESC LIMIT {int(limit)}"
+    ), get_engine())
+
+
+def get_oil_reference(oil_type_id) -> dict:
+    """Largest quantity and rate seen so far for an oil type, used by the app's
+    'unusually large value' typo guard. Returns zeros when there's no history."""
+    engine = get_engine()
+    max_qty = pd.read_sql(text(
+        "SELECT MAX(q) AS m FROM ("
+        "SELECT quantity AS q FROM incoming_transactions WHERE oil_type_id = :id "
+        "UNION ALL SELECT quantity AS q FROM outgoing_transactions WHERE oil_type_id = :id) t"
+    ), engine, params={"id": oil_type_id})["m"].iloc[0]
+    max_rate = pd.read_sql(text(
+        "SELECT MAX(rate) AS m FROM incoming_transactions WHERE oil_type_id = :id"
+    ), engine, params={"id": oil_type_id})["m"].iloc[0]
+    return {"max_qty": float(max_qty or 0), "max_rate": float(max_rate or 0)}
 
 
 # ---------------------------------------------------------------------------
