@@ -67,10 +67,45 @@ def require_login():
     st.stop()
 
 
+@st.cache_resource(show_spinner=False)
+def _ensure_db_ready():
+    """Run schema setup / migration once per app start, not on every rerun."""
+    db.init_db()
+    return True
+
+
+# Cached reads: these keep navigation and typing snappy by not re-querying the
+# database on every rerun. `st.cache_data.clear()` is called after every write
+# so saved changes show up immediately; the short TTL keeps other devices fresh.
+@st.cache_data(ttl=60, show_spinner=False)
+def load_oil_types():
+    return db.get_oil_types()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_stock_by_oil_type():
+    return db.get_stock_by_oil_type()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_transactions(start=None, end=None, oil_type_id=None, txn_type="All"):
+    return db.get_transactions(start, end, oil_type_id, txn_type)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_editable_transactions():
+    return db.get_editable_transactions()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_stock_ledger(oil_type_id):
+    return db.get_stock_ledger(oil_type_id)
+
+
 require_login()
 
 try:
-    db.init_db()
+    _ensure_db_ready()
 except Exception as e:
     st.error("⚠️ The app couldn't connect to the database.")
     st.markdown(
@@ -86,7 +121,7 @@ except Exception as e:
 def page_dashboard():
     st.title("🛢️ Current Stock & Inventory Valuation")
 
-    by_oil = db.get_stock_by_oil_type()
+    by_oil = load_stock_by_oil_type()
 
     total_stock = by_oil["current_stock"].sum()
     total_value = by_oil["total_value"].sum()
@@ -134,7 +169,7 @@ def page_dashboard():
 def page_incoming():
     st.title("📥 Incoming Stock Entry (Unloading)")
 
-    oil_types = db.get_oil_types()
+    oil_types = load_oil_types()
     if oil_types.empty:
         st.warning("No oil types configured yet. Add them on the **Setup & Manage** page first.")
         return
@@ -155,6 +190,7 @@ def page_incoming():
             st.error("Rate must be greater than zero.")
         else:
             db.add_incoming(entry_date.isoformat(), oil_type_id, quantity, rate, supplier)
+            st.cache_data.clear()
             st.success(f"Logged {quantity:,.0f} L of {oil_type_name} into stock.")
             st.rerun()
 
@@ -162,12 +198,12 @@ def page_incoming():
 def page_outgoing():
     st.title("📤 Outgoing Stock Entry (Tanker Filling)")
 
-    oil_types = db.get_oil_types()
+    oil_types = load_oil_types()
     if oil_types.empty:
         st.warning("No oil types configured yet. Add them on the **Setup & Manage** page first.")
         return
 
-    stock = db.get_stock_by_oil_type().set_index("oil_type")["current_stock"].to_dict()
+    stock = load_stock_by_oil_type().set_index("oil_type")["current_stock"].to_dict()
 
     with st.form("outgoing_form", clear_on_submit=True):
         entry_date = st.date_input("Date", value=date.today())
@@ -192,6 +228,7 @@ def page_outgoing():
         else:
             try:
                 db.add_outgoing(entry_date.isoformat(), oil_type_id, quantity, buyer, notes)
+                st.cache_data.clear()
                 st.success(f"Logged {quantity:,.0f} L of {oil_type_name} out.")
                 st.rerun()
             except ValueError as e:
@@ -201,7 +238,7 @@ def page_outgoing():
 def page_history():
     st.title("📜 History & Transaction Logs")
 
-    oil_types = db.get_oil_types()
+    oil_types = load_oil_types()
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -217,11 +254,11 @@ def page_history():
     if oil_filter != "All":
         oil_type_id = int(oil_types.loc[oil_types["name"] == oil_filter, "id"].iloc[0])
 
-    df = db.get_transactions(
-        start_date=start_date.isoformat() if isinstance(start_date, date) else None,
-        end_date=end_date.isoformat() if isinstance(end_date, date) else None,
-        oil_type_id=oil_type_id,
-        txn_type=txn_type,
+    df = load_transactions(
+        start_date.isoformat() if isinstance(start_date, date) else None,
+        end_date.isoformat() if isinstance(end_date, date) else None,
+        oil_type_id,
+        txn_type,
     )
 
     display = df.rename(columns={
@@ -244,12 +281,12 @@ def page_edit():
     st.caption("Fix or remove a single entry that was logged by mistake. Stock levels are "
                "corrected automatically.")
 
-    txns = db.get_editable_transactions()
+    txns = load_editable_transactions()
     if txns.empty:
         st.info("There are no transactions to edit yet.")
         return
 
-    oil_types = db.get_oil_types()
+    oil_types = load_oil_types()
 
     def _label(i):
         r = txns.iloc[i]
@@ -303,6 +340,7 @@ def page_edit():
                 else:
                     db.update_outgoing(txn_id, new_date.isoformat(), new_oil_id, new_qty,
                                        new_party, new_notes)
+                st.cache_data.clear()
                 st.success("Entry updated — stock has been corrected.")
                 st.rerun()
             except Exception as e:
@@ -318,6 +356,7 @@ def page_edit():
                 db.delete_incoming(txn_id)
             else:
                 db.delete_outgoing(txn_id)
+            st.cache_data.clear()
             st.success("Entry deleted — stock has been corrected.")
             st.rerun()
         except Exception as e:
@@ -330,7 +369,7 @@ def page_ledger():
                "after every incoming and outgoing entry. The rate uses FIFO — the oldest oil "
                "is counted as sold first.")
 
-    oil_types = db.get_oil_types()
+    oil_types = load_oil_types()
     if oil_types.empty:
         st.info("No oil types yet. Add them on the **Setup & Manage** page.")
         return
@@ -338,7 +377,7 @@ def page_ledger():
     oil_name = st.selectbox("Oil Type", oil_types["name"])
     oid = int(oil_types.loc[oil_types["name"] == oil_name, "id"].iloc[0])
 
-    ledger = db.get_stock_ledger(oid)
+    ledger = load_stock_ledger(oid)
     if ledger.empty:
         st.info("No transactions for this oil type yet.")
         return
@@ -375,8 +414,8 @@ def page_backups():
              "email, or a USB stick. Doing this now and then gives you a personal copy in your "
              "own hands.")
 
-    all_txns = db.get_transactions()
-    stock = db.get_stock_by_oil_type()
+    all_txns = load_transactions()
+    stock = load_stock_by_oil_type()
 
     col1, col2 = st.columns(2)
     with col1:
@@ -411,7 +450,7 @@ def page_setup():
     st.caption("Manage the oil types you store. Day-to-day stock entry stays on the "
                "Incoming / Outgoing pages.")
 
-    oil_types = db.get_oil_types()
+    oil_types = load_oil_types()
 
     st.subheader("Oil Types")
     if not oil_types.empty:
@@ -425,6 +464,7 @@ def page_setup():
         if st.form_submit_button("➕ Add oil type") and new_oil.strip():
             try:
                 db.add_oil_type(new_oil.strip())
+                st.cache_data.clear()
                 st.success(f"Added '{new_oil.strip()}'.")
                 st.rerun()
             except Exception as e:
@@ -436,6 +476,7 @@ def page_setup():
             try:
                 oid = int(oil_types.loc[oil_types["name"] == del_oil, "id"].iloc[0])
                 db.delete_oil_type(oid)
+                st.cache_data.clear()
                 st.success(f"Removed '{del_oil}'.")
                 st.rerun()
             except Exception as e:
