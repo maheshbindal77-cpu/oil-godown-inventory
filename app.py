@@ -125,7 +125,8 @@ def _big_value_warning(ref, quantity, rate=None):
                     f"₹{ref['max_rate']:,.2f})")
     if not msgs:
         return None
-    return (" and ".join(msgs) + ".").capitalize()
+    msg = " and ".join(msgs) + "."
+    return msg[0].upper() + msg[1:]
 
 
 require_login()
@@ -209,6 +210,8 @@ def page_incoming():
         submitted = st.form_submit_button("Save Incoming Entry")
 
     if submitted:
+        # A fresh submission supersedes any earlier unconfirmed big-value entry.
+        st.session_state.pop("pending_in", None)
         oil_type_id = int(oil_types.loc[oil_types["name"] == oil_type_name, "id"].iloc[0])
         if quantity <= 0:
             st.error("Quantity must be greater than zero.")
@@ -266,6 +269,8 @@ def page_outgoing():
         submitted = st.form_submit_button("Save Outgoing Entry")
 
     if submitted:
+        # A fresh submission supersedes any earlier unconfirmed big-value entry.
+        st.session_state.pop("pending_out", None)
         oil_type_id = int(oil_types.loc[oil_types["name"] == oil_type_name, "id"].iloc[0])
         available = stock.get(oil_type_name, 0)
         if quantity <= 0:

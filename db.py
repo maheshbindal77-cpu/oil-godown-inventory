@@ -207,18 +207,36 @@ def _oil_type_stock(conn, oil_type_id) -> float:
 
 
 def _validate_oil_stock(conn, oil_type_id):
-    """Raise if an oil type's stock would go negative (more out than in)."""
+    """Raise if an oil type's stock would go negative at ANY point in date order
+    — i.e. more oil leaves than was in the godown at that time. Checking the
+    running balance (not just the final total) also keeps the FIFO valuation
+    consistent with the plain in-minus-out total."""
     if oil_type_id is None:
         return
-    stock = _oil_type_stock(conn, oil_type_id)
-    if stock < -1e-6:
-        name = conn.execute(
-            text("SELECT name FROM oil_types WHERE id = :id"), {"id": oil_type_id}
-        ).scalar()
-        raise ValueError(
-            f"This change would make {name} stock negative ({stock:g} L) — more would go out "
-            "than exists. Fix the other entries for this oil type first."
-        )
+    rows = conn.execute(
+        text(
+            "SELECT typ, qty, date FROM ("
+            "SELECT date AS date, 'In' AS typ, quantity AS qty, id AS id "
+            "FROM incoming_transactions WHERE oil_type_id = :id "
+            "UNION ALL "
+            "SELECT date AS date, 'Out' AS typ, quantity AS qty, id AS id "
+            "FROM outgoing_transactions WHERE oil_type_id = :id"
+            ") t ORDER BY date, CASE typ WHEN 'In' THEN 0 ELSE 1 END, id"
+        ),
+        {"id": oil_type_id},
+    ).fetchall()
+    balance = 0.0
+    for r in rows:
+        balance += float(r.qty) if r.typ == "In" else -float(r.qty)
+        if balance < -1e-6:
+            name = conn.execute(
+                text("SELECT name FROM oil_types WHERE id = :id"), {"id": oil_type_id}
+            ).scalar()
+            raise ValueError(
+                f"This change would make {name} stock go negative on {r.date} — more oil would "
+                "leave than was in the godown at that point. Check the dates and quantities of "
+                "this oil type's entries."
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -234,12 +252,15 @@ def add_incoming(date, oil_type_id, quantity, rate, supplier):
 def add_outgoing(date, oil_type_id, quantity, buyer, notes):
     with get_engine().begin() as conn:
         stock = _oil_type_stock(conn, oil_type_id)
-        if quantity > stock:
+        if quantity > stock + 1e-6:
             raise ValueError(
                 f"Cannot dispatch {quantity:g} — only {stock:g} of this oil is currently in the godown."
             )
         conn.execute(outgoing_transactions.insert().values(
             date=date, oil_type_id=oil_type_id, quantity=quantity, buyer=buyer, notes=notes))
+        # Guard against a back-dated dispatch that exceeds the stock available on
+        # its own date (which the current-total check above would miss).
+        _validate_oil_stock(conn, oil_type_id)
 
 
 # ---------------------------------------------------------------------------
