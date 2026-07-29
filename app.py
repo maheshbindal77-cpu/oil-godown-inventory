@@ -13,6 +13,23 @@ import db
 
 st.set_page_config(page_title="Oil Godown Inventory", page_icon="🛢️", layout="wide")
 
+# Light presentation-only tweaks. These affect appearance only — never data or
+# logic. The @media block applies solely to phone-sized screens, so the desktop
+# layout is unchanged.
+st.markdown(
+    """
+    <style>
+      .block-container { padding-top: 3rem; }
+      @media (max-width: 640px) {
+        .block-container { padding-top: 1.25rem; padding-left: 1rem; padding-right: 1rem; }
+        h1 { font-size: 1.9rem !important; line-height: 1.25 !important; }
+        h2 { font-size: 1.4rem !important; }
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # Pages an "operator" is allowed to see. Everything else is manager-only. This
 # is only used if a separate `admin_password` secret is configured; otherwise a
