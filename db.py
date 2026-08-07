@@ -8,7 +8,6 @@ otherwise so the app can be run locally for testing.
 """
 
 import os
-from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -209,8 +208,8 @@ def _oil_type_stock(conn, oil_type_id) -> float:
 def _validate_oil_stock(conn, oil_type_id):
     """Raise if an oil type's stock would go negative at ANY point in date order
     — i.e. more oil leaves than was in the godown at that time. Checking the
-    running balance (not just the final total) also keeps the FIFO valuation
-    consistent with the plain in-minus-out total."""
+    running balance (not just the final total) prevents impossible dispatches
+    and keeps the weighted-average valuation sensible."""
     if oil_type_id is None:
         return
     rows = conn.execute(
@@ -443,8 +442,10 @@ def get_oil_reference(oil_type_id) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# FIFO valuation — the rate reflects the oil actually still in the godown.
-# Outflows are matched against the oldest purchases first.
+# Moving weighted-average cost valuation. Each incoming shipment re-blends the
+# average cost of everything in stock; outgoing shipments leave the average
+# unchanged (they go out valued at the current average) and just reduce the
+# quantity. The average only ever moves when a new purchase is logged.
 # ---------------------------------------------------------------------------
 
 def _all_transactions_ordered(oil_type_id=None) -> pd.DataFrame:
@@ -474,37 +475,42 @@ def _all_transactions_ordered(oil_type_id=None) -> pd.DataFrame:
     return df.sort_values(["date", "type_rank", "id"]).reset_index(drop=True)
 
 
-def _fifo_remaining(transactions):
-    """Consume each outflow against the oldest inflows first; return the batches
-    still in stock as a list of [quantity, rate]."""
-    batches = deque()
+def _avg_cost_steps(transactions):
+    """Apply the moving weighted-average cost method in chronological order,
+    yielding (txn, qty_after, avg_after, value_after) after each transaction.
+
+    Incoming re-blends the average:
+        new_avg = (old_qty*old_avg + in_qty*in_rate) / (old_qty + in_qty)
+    Outgoing leaves the average untouched and only reduces the quantity, so it
+    is effectively valued at the current average."""
+    qty = 0.0
+    avg = 0.0
     for t in transactions:
         if t["type"] == "In":
-            batches.append([float(t["quantity"]), float(t["rate"])])
+            in_qty = float(t["quantity"])
+            in_rate = float(t["rate"])
+            new_qty = qty + in_qty
+            if new_qty > 1e-9:
+                avg = (qty * avg + in_qty * in_rate) / new_qty
+            qty = new_qty
         else:
-            out = float(t["quantity"])
-            while out > 1e-9 and batches:
-                b = batches[0]
-                take = min(b[0], out)
-                b[0] -= take
-                out -= take
-                if b[0] <= 1e-9:
-                    batches.popleft()
-    return list(batches)
+            qty -= float(t["quantity"])
+            if qty < 1e-9:
+                qty = 0.0  # emptied out; the average is retained but value is 0
+        yield t, qty, avg, qty * avg
 
 
 def get_stock_by_oil_type() -> pd.DataFrame:
-    """Current stock, FIFO average rate, and FIFO valuation per oil type."""
+    """Current stock, weighted-average rate, and valuation per oil type."""
     oils = get_oil_types()
     alltx = _all_transactions_ordered()
     rows = []
     for _, o in oils.iterrows():
         oid = int(o["id"])
         txns = alltx[alltx["oil_type_id"] == oid].to_dict("records") if not alltx.empty else []
-        batches = _fifo_remaining(txns)
-        qty = sum(b[0] for b in batches)
-        value = sum(b[0] * b[1] for b in batches)
-        avg = value / qty if qty > 1e-9 else 0.0
+        qty = avg = value = 0.0
+        for _t, qty, avg, value in _avg_cost_steps(txns):
+            pass  # only the final state (after the last transaction) is needed
         rows.append({"oil_type_id": oid, "oil_type": o["name"],
                      "current_stock": qty, "weighted_avg_rate": avg, "total_value": value})
     return pd.DataFrame(rows, columns=["oil_type_id", "oil_type", "current_stock",
@@ -513,27 +519,14 @@ def get_stock_by_oil_type() -> pd.DataFrame:
 
 def get_stock_ledger(oil_type_id) -> pd.DataFrame:
     """Running history for one oil type: after each entry, the resulting stock
-    quantity, FIFO average rate, and value at that point in time."""
+    quantity, weighted-average rate, and value at that point in time."""
     alltx = _all_transactions_ordered(oil_type_id)
-    batches = deque()
     rows = []
-    for t in alltx.to_dict("records"):
+    for t, qty, avg, value in _avg_cost_steps(alltx.to_dict("records")):
         if t["type"] == "In":
-            batches.append([float(t["quantity"]), float(t["rate"])])
             change = f"+ {t['quantity']:,.0f} L  @ ₹{t['rate']:,.2f}"
         else:
-            out = float(t["quantity"])
-            while out > 1e-9 and batches:
-                b = batches[0]
-                take = min(b[0], out)
-                b[0] -= take
-                out -= take
-                if b[0] <= 1e-9:
-                    batches.popleft()
-            change = f"− {t['quantity']:,.0f} L"
-        qty = sum(b[0] for b in batches)
-        value = sum(b[0] * b[1] for b in batches)
-        avg = value / qty if qty > 1e-9 else 0.0
+            change = f"− {t['quantity']:,.0f} L  @ ₹{avg:,.2f} (avg)"
         rows.append({
             "Date": t["date"],
             "Movement": "Incoming" if t["type"] == "In" else "Outgoing",

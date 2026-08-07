@@ -506,8 +506,9 @@ def page_edit():
 def page_ledger():
     st.title("📈 Stock & Rate History")
     st.caption("For each oil type, see how its stock quantity and its average rate changed "
-               "after every incoming and outgoing entry. The rate uses FIFO — the oldest oil "
-               "is counted as sold first.")
+               "after every incoming and outgoing entry. The rate is a running weighted "
+               "average: each new purchase re-blends the average, and dispatches go out at the "
+               "current average, leaving it unchanged.")
 
     oil_types = load_oil_types()
     if oil_types.empty:
